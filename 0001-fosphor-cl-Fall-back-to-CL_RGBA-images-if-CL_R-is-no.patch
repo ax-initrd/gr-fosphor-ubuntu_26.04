@@ -1,0 +1,149 @@
+From 28fb58578507f120b26973a037677632a8ca86af Mon Sep 17 00:00:00 2001
+From: ax <ax@initrd.net>
+Date: Mon, 28 Sep 2026 14:18:32 +0200
+Subject: [PATCH 1/2] fosphor/cl: Fall back to CL_RGBA images if CL_R is not
+ supported
+
+The non CL/GL-sharing path creates its waterfall and histogram images
+with a CL_R / CL_FLOAT format. Not every implementation supports single
+channel images though: PoCL for instance only ever exposes CL_RGBA and
+CL_BGRA, so clCreateImage() fails there with CL_INVALID_OPERATION and
+fosphor can't initialize at all.
+
+Probe the format with clGetSupportedImageFormats() and fall back to
+CL_RGBA when CL_R isn't available. The kernels already read and write
+float4 and only ever use the first component, so they need no change:
+only the host side buffer stride and the GL upload format have to
+follow.
+
+Signed-off-by: ax <ax@initrd.net>
+---
+ lib/fosphor/cl.c      | 36 ++++++++++++++++++++++++++++++++++++
+ lib/fosphor/fosphor.c |  6 ++++--
+ lib/fosphor/gl.c      | 10 ++++++----
+ lib/fosphor/private.h |  1 +
+ 4 files changed, 47 insertions(+), 6 deletions(-)
+
+diff --git a/lib/fosphor/cl.c b/lib/fosphor/cl.c
+index 0b692b7..a3cd4a5 100644
+--- a/lib/fosphor/cl.c
++++ b/lib/fosphor/cl.c
+@@ -502,6 +502,30 @@ error:
+ 	return err;
+ }
+ 
++static int
++cl_image_format_supported(cl_context ctx, const cl_image_format *fmt)
++{
++	cl_image_format fmts[128];
++	cl_uint i, n = 0;
++
++	if (clGetSupportedImageFormats(ctx, CL_MEM_READ_WRITE,
++	                               CL_MEM_OBJECT_IMAGE2D,
++	                               sizeof(fmts) / sizeof(fmts[0]),
++	                               fmts, &n) != CL_SUCCESS)
++		return 0;
++
++	if (n > (sizeof(fmts) / sizeof(fmts[0])))
++		n = sizeof(fmts) / sizeof(fmts[0]);
++
++	for (i=0; i<n; i++)
++		if ((fmts[i].image_channel_order     == fmt->image_channel_order) &&
++		    (fmts[i].image_channel_data_type == fmt->image_channel_data_type))
++			return 1;
++
++	return 0;
++}
++
++
+ static int
+ cl_init_buffers_nogl(struct fosphor *self)
+ {
+@@ -511,9 +535,21 @@ cl_init_buffers_nogl(struct fosphor *self)
+ 	cl_int err;
+ 
+ 	/* Common settings */
++	/* Not all implementations support single channel images. PoCL for
++	 * instance only ever exposes CL_RGBA / CL_BGRA. Probe for CL_R and
++	 * fall back to CL_RGBA if it's not available: the kernels already
++	 * read/write float4 and only use the first component, so only the
++	 * host side buffer stride needs to be adjusted. */
+ 	img_fmt.image_channel_order = CL_R;
+ 	img_fmt.image_channel_data_type = CL_FLOAT;
+ 
++	if (!cl_image_format_supported(cl->ctx, &img_fmt)) {
++		fprintf(stderr, "[+] CL_R/CL_FLOAT images unsupported, "
++		                "falling back to CL_RGBA\n");
++		img_fmt.image_channel_order = CL_RGBA;
++		self->flags |= FLG_FOSPHOR_NOGL_RGBA;
++	}
++
+ 	img_desc.image_type = CL_MEM_OBJECT_IMAGE2D;
+ 	img_desc.image_width = FOSPHOR_FFT_LEN;
+ 	img_desc.image_depth = 0;
+diff --git a/lib/fosphor/fosphor.c b/lib/fosphor/fosphor.c
+index 5478bad..11bdab9 100644
+--- a/lib/fosphor/fosphor.c
++++ b/lib/fosphor/fosphor.c
+@@ -51,8 +51,10 @@ fosphor_init(void)
+ 	/* Buffers (if needed) */
+ 	if (!(self->flags & FLG_FOSPHOR_USE_CLGL_SHARING))
+ 	{
+-		self->img_waterfall = malloc(FOSPHOR_FFT_LEN * 1024 * sizeof(float));
+-		self->img_histogram = malloc(FOSPHOR_FFT_LEN *  128 * sizeof(float));
++		int ps = (self->flags & FLG_FOSPHOR_NOGL_RGBA) ? 4 : 1;
++
++		self->img_waterfall = malloc(ps * FOSPHOR_FFT_LEN * 1024 * sizeof(float));
++		self->img_histogram = malloc(ps * FOSPHOR_FFT_LEN *  128 * sizeof(float));
+ 		self->buf_spectrum  = malloc(2 * 2 * FOSPHOR_FFT_LEN * sizeof(float));
+ 
+ 		if (!self->img_waterfall ||
+diff --git a/lib/fosphor/gl.c b/lib/fosphor/gl.c
+index e36bc1d..93bc07a 100644
+--- a/lib/fosphor/gl.c
++++ b/lib/fosphor/gl.c
+@@ -101,14 +101,14 @@ gl_tex2d_float_clear(GLuint tex_id, int width, int height)
+ #endif
+ 
+ static void
+-gl_tex2d_write(GLuint tex_id, float *src, int width, int height)
++gl_tex2d_write(GLuint tex_id, float *src, int width, int height, GLenum fmt)
+ {
+ 	glBindTexture(GL_TEXTURE_2D, tex_id);
+ 
+ 	glTexSubImage2D(
+ 		GL_TEXTURE_2D, 0,
+ 		0, 0, width, height,
+-		GL_RED, GL_FLOAT,
++		fmt, GL_FLOAT,
+ 		src
+ 	);
+ }
+@@ -344,8 +344,10 @@ fosphor_gl_refresh(struct fosphor *self)
+ 
+ 	gl_deferred_init(self);
+ 
+-	gl_tex2d_write(gl->tex_waterfall, self->img_waterfall, FOSPHOR_FFT_LEN, 1024);
+-	gl_tex2d_write(gl->tex_histogram, self->img_histogram, FOSPHOR_FFT_LEN,  128);
++	GLenum fmt = (self->flags & FLG_FOSPHOR_NOGL_RGBA) ? GL_RGBA : GL_RED;
++
++	gl_tex2d_write(gl->tex_waterfall, self->img_waterfall, FOSPHOR_FFT_LEN, 1024, fmt);
++	gl_tex2d_write(gl->tex_histogram, self->img_histogram, FOSPHOR_FFT_LEN,  128, fmt);
+ 	gl_vbo_write(gl->vbo_spectrum, self->buf_spectrum, 2 * 2 * sizeof(float) * FOSPHOR_FFT_LEN);
+ }
+ 
+diff --git a/lib/fosphor/private.h b/lib/fosphor/private.h
+index fcf33a2..3e77b09 100644
+--- a/lib/fosphor/private.h
++++ b/lib/fosphor/private.h
+@@ -33,6 +33,7 @@ struct fosphor
+ 	struct fosphor_gl_state *gl;
+ 
+ #define FLG_FOSPHOR_USE_CLGL_SHARING	(1<<0)
++#define FLG_FOSPHOR_NOGL_RGBA		(1<<1)
+ 	int flags;
+ 
+ 	float fft_win[FOSPHOR_FFT_LEN];
+-- 
+2.54.0 (Apple Git-157)
+
